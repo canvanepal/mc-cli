@@ -24,4 +24,4 @@ Thumbs.db
 
 # Reverse-engineered chunks (large, not source)
 mc_chunks/
-js_chunks/
+js_chunks/mc_worker_url.txt

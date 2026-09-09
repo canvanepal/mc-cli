@@ -483,6 +483,38 @@ async function main() {
       if (!target) { process.stdout.write("Usage: mc keepalive [account|all]\r\n"); return; }
       return cmdKeepalive(s, target, false);
     }
+    case "sync": {
+      // mc sync [n|all] — push local cookie(s) into the worker KV so the
+      // cron keepalive + wake endpoints cover them. `all` is the default.
+      // Worker URL comes from env (MC_WORKER_URL) or mc_worker_url.txt next to the script —
+      // no personal URLs in the repo. Set once:  setx MC_WORKER_URL https://<your-worker>.workers.dev
+      const WORKER_URL = process.env.MC_WORKER_URL
+        || (() => { try { return require("fs").readFileSync(path.join(__dirname, "mc_worker_url.txt"), "utf8").trim(); } catch { return null; } })();
+      if (!WORKER_URL) { process.stdout.write("No worker URL. Set MC_WORKER_URL env var or mc_worker_url.txt (see README)\r\n"); return; }
+      const targets = (!arg1 || arg1 === "all") ? Object.keys(s.accounts) : (s.accounts[arg1] ? [arg1] : null);
+      if (!targets) { process.stdout.write(`No account '${arg1}'\r\n`); return; }
+      process.stdout.write(`Syncing ${targets.length} account(s) → worker KV…\r\n`);
+      const results = await Promise.all(targets.map(async (n) => {
+        try {
+          const res = await fetch(`${WORKER_URL}/set/${encodeURIComponent(n)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cookie: s.accounts[n].cookie }),
+          });
+          const j = await res.json().catch(() => ({}));
+          return { n, ok: res.ok && j.ok };
+        } catch { return { n, ok: false };
+        }
+      }));
+      for (const r of results) {
+        process.stdout.write(`  ${r.n.padEnd(4)} ${r.ok ? "\x1b[32m● synced\x1b[0m" : "\x1b[31m✗ failed\x1b[0m"}\r\n`);
+      }
+      const okCount = results.filter(r => r.ok).length;
+      process.stdout.write(okCount === results.length
+        ? `\x1b[32mAll ${okCount} account(s) synced — cron keepalive now covers them\x1b[0m\r\n`
+        : `\x1b[33m${okCount}/${results.length} synced — retry failures with: mc sync <n>\x1b[0m\r\n`);
+      return;
+    }
     case "check": {
       // pass [n] to check only one account, or no arg for all
       const { execSync } = require("child_process");
@@ -503,7 +535,7 @@ async function main() {
       // `mc` or `mc <account>` → connect that account's last task
       const a = activeAccount(s); saveSession(s);
       if (!a) {
-        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc connect <id>   connect a saved task\n  mc keepalive [n|all]  keep tasks awake (no hibernation, token-free)\n`);
+        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc connect <id>   connect a saved task\n  mc keepalive [n|all]  keep tasks awake (no hibernation, token-free)\n  mc sync [n|all]     push cookies to worker KV (cron keepalive + wake coverage)\n`);
         return;
       }
       // `mc <name>` where <name> is an existing account → switch + connect IT
