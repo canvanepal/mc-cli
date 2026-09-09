@@ -10,4 +10,4 @@ kv_namespaces = [
 ]
 
 [triggers]
-crons = ["0 */6 * * *"]   # every 6 hours
+crons = ["*/2 * * * *", "0 */6 * * *"]   # */2 = keepalive pulse, 6h = cookie status check

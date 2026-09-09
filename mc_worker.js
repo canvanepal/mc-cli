@@ -23,8 +23,11 @@
  *   GET  /wake-all                wake ALL accounts' hibernated tasks, return results
  *   These use the stored cookies in KV + the same control-WS {"type":"resume"} the CLI uses.
  *
- * Cron (set in wrangler.toml — every 6 hours):
- *   checks all accounts, updates cookie if dead, logs status
+ * Cron (set in wrangler.toml — two schedules):
+ *   *\u002f2 * * * *   keepalive pulse: control-WS {"type":"resume"} to each account's active
+ *                    task — resets the idle timer so VMs never hibernate. Read-only on KV
+ *                    (free plan: 1k KV writes/day — we write NOTHING per pulse).
+ *   0 *\u002f6 * * *    status check: verify each cookie is alive, store status in KV
  */
 
 const API = "https://monkeycode-ai.net/api/v1";
@@ -65,6 +68,9 @@ export default {
           if (url.pathname === "/wake-all") return json(await wakeAll(env));
           const wakeMatch = url.pathname.match(/^\/wake\/(.+)$/);
           if (wakeMatch) return json(await wakeAccount(env, wakeMatch[1]));
+          if (url.pathname === "/keepalive" || url.pathname === "/keepalive-all") return json(await keepaliveAll(env));
+          const keepaliveMatch = url.pathname.match(/^\/keepalive\/(.+)$/);
+          if (keepaliveMatch) return json(await keepaliveAll(env, keepaliveMatch[1]));
           if (setMatch) {
             const body = await request.json().catch(() => ({}));
             if (!body.cookie) return json({ error: "body.cookie required" }, 400);
@@ -79,21 +85,27 @@ export default {
     }
   },
 
-  // Cron handler — runs every 6 hours
+  // Cron handler — two schedules: */2 * * * * (keepalive) and 0 */6 * * * (status)
   async scheduled(event, env) {
-    const keys = await env.KV.list({ prefix: "cookie:" });
-    for (const key of keys.keys) {
-      const name = key.name.replace("cookie:", "");
-      try {
-        const res = await apiFetch(env, name, "/users/status");
-        await env.KV.put(`status:${name}`, JSON.stringify({
-          ok: true, timestamp: Date.now(),
-        }));
-      } catch (e) {
-        await env.KV.put(`status:${name}`, JSON.stringify({
-          ok: false, error: e.message, timestamp: Date.now(),
-        }));
+    const isStatusCron = event.cron === "0 */6 * * *";
+    try {
+      if (isStatusCron) {
+        const keys = await env.KV.list({ prefix: "cookie:" });
+        for (const key of keys.keys) {
+          const name = key.name.replace("cookie:", "");
+          try {
+            await apiFetch(env, name, "/users/status");
+            await env.KV.put(`status:${name}`, JSON.stringify({ ok: true, timestamp: Date.now() }));
+          } catch (e) {
+            await env.KV.put(`status:${name}`, JSON.stringify({ ok: false, error: e.message, timestamp: Date.now() }));
+          }
+        }
+      } else {
+        // keepalive cron — pulse-only, read-only on KV, ~1 subrequest per account
+        return await keepaliveAll(env);
       }
+    } catch (e) {
+      console.error("scheduled failed:", e.message);
     }
   },
 };
@@ -188,6 +200,58 @@ function json(data, status = 200) {
     status,
     headers: { ...CORS, "Cache-Control": "no-store" },
   });
+}
+
+/* ---- keepalive (cron + manual) ---- */
+
+// One short control-WS pulse: send {"type":"resume"}, hold ~1s, close.
+// Verified harmless on online VMs (no state change) and it also wakes hibernated
+// ones — so one signal covers both "stay awake" and "un-hibernate".
+async function pulseResume(cookie, taskId) {
+  const url = `${API}/users/tasks/control?id=${encodeURIComponent(taskId)}`;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; try { ws && ws.close(); } catch {} resolve(v); } };
+    let ws = null;
+    const t = setTimeout(() => finish("timeout"), 4000);
+    (async () => {
+      try {
+        const resp = await fetch(url, {
+          headers: { Upgrade: "websocket", Connection: "Upgrade", Cookie: cookie, Origin: "https://monkeycode-ai.net" },
+        });
+        ws = resp.webSocket;
+        if (!ws) { clearTimeout(t); return finish("no-upgrade"); }
+        ws.accept();
+        ws.send(JSON.stringify({ type: "resume" }));
+        setTimeout(() => { clearTimeout(t); finish("pulsed"); }, 1000);
+        ws.addEventListener("error", () => { clearTimeout(t); finish("error"); });
+        ws.addEventListener("close", () => { clearTimeout(t); finish("pulsed"); });
+      } catch (e) { clearTimeout(t); finish("error"); }
+    })();
+  });
+}
+
+// Pulse every account's active task(s). Sequential, one GET + one WS per
+// account. Designed for the free plan: NO KV writes, no status polling.
+async function keepaliveAll(env, onlyAccount = null) {
+  const keys = await env.KV.list({ prefix: "cookie:" });
+  let names = keys.keys.map(k => k.name.replace("cookie:", ""));
+  if (onlyAccount) names = names.filter(n => n === onlyAccount);
+  const results = [];
+  for (const n of names) {
+    try {
+      const tj = await apiFetch(env, n, "/users/tasks?page=1&size=5&status=pending,processing");
+      const tasks = (tj.tasks || []).filter(t => t.status === "pending" || t.status === "processing");
+      if (!tasks.length) { results.push({ account: n, action: "no-active-task" }); continue; }
+      for (const t of tasks.slice(0, 2)) { // cap 2 tasks/account (subrequest headroom)
+        const r = await pulseResume(await env.KV.get(`cookie:${n}`), t.id);
+        results.push({ account: n, task: t.id.slice(0, 8), pulse: r });
+      }
+    } catch (e) {
+      results.push({ account: n, error: e.message === "EXPIRED" ? "cookie-expired" : e.message });
+    }
+  }
+  return { status: "done", accounts: names.length, at: new Date().toISOString(), results };
 }
 
 /* ---- wake hibernated VMs (token-free resume via control WS) ---- */
