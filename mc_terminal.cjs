@@ -208,6 +208,10 @@ async function cmdConnectTask(account, taskId) {
     }
   }
 
+  // hold the connection open with a token-free pulse so the idle timer
+  // never reaches hibernation while the user is attached
+  startKeepalive(account.cookie, [taskId]);
+
   let terminals;
   try {
     terminals = await getTaskTerminals(account.cookie, t.vm_id);
@@ -269,6 +273,7 @@ function wakeTask(cookie, taskId) {
     const timer = setTimeout(() => {
       if (!settled) { settled = true; try { ws.close(); } catch {} reject(new Error("Wake timed out")); }
     }, 20000);
+    keepaliveTimers.has(taskId) && stopKeepalive(taskId); // avoid duplicate keepalive for same task
     ws.onopen = () => ws.send(JSON.stringify({ type: "resume" }));
     ws.onerror = () => { /* keep polling — signal already sent */ };
     ws.onclose = () => { /* control WS may close — keep polling */ };
@@ -289,6 +294,65 @@ function wakeTask(cookie, taskId) {
       if (!settled) { settled = true; clearTimeout(timer); try { ws.close(); } catch {} reject(new Error("Timed out waiting for VM to wake")); }
     })();
   });
+}
+
+/* ---------------- keepalive (prevent hibernation) ---------------- */
+
+// A control-WS {"type":"resume"} to an ONLINE vm is verified harmless (no state
+// change, no error) — so we reuse it as an "activity" pulse that resets the
+// idle timer. Cheap: one short-lived WS every KEEPALIVE_INTERVAL ms.
+const KEEPALIVE_INTERVAL = 3 * 60 * 1000; // every 3 min (hibernation kicks in ~4-5 min idle)
+const keepaliveTimers = new Map(); // taskId -> interval
+
+function pingResume(cookie, taskId) {
+  return new Promise((resolve) => {
+    try {
+      const ws = new WebSocket(
+        `${API.replace("https", "wss")}/users/tasks/control?id=${encodeURIComponent(taskId)}`,
+        { headers: cookie ? { Cookie: cookie } : {} }
+      );
+      const done = (v) => { try { ws.close(); } catch {}; resolve(v); };
+      const t = setTimeout(() => done("timeout"), 8000);
+      ws.onopen = () => ws.send(JSON.stringify({ type: "resume" }));
+      ws.onmessage = () => { clearTimeout(t); done("ack"); };
+      ws.onerror = () => { clearTimeout(t); done("error"); };
+      ws.onclose = () => { clearTimeout(t); done("closed"); };
+    } catch { resolve("error"); }
+  });
+}
+
+// Keep one task (or all tasks of an account) awake until stopped.
+function startKeepalive(cookie, taskIds, { log } = {}) {
+  const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
+  const timer = setInterval(async () => {
+    for (const id of ids) {
+      const r = await pingResume(cookie, id);
+      if (log) process.stdout.write(`\x1b[90m[keepalive ${id.slice(0, 8)}] ${r}\x1b[0m\r\n`);
+    }
+  }, KEEPALIVE_INTERVAL);
+  // fire one pulse immediately so the task is refreshed right away
+  for (const id of ids) pingResume(cookie, id);
+  return timer;
+}
+
+function stopKeepalive(taskId) {
+  if (taskId) { const t = keepaliveTimers.get(taskId); if (t) { clearInterval(t); keepaliveTimers.delete(taskId); } }
+  else { for (const t of keepaliveTimers.values()) clearInterval(t); keepaliveTimers.clear(); }
+}
+
+// standalone `mc keepalive [n|all]` — keeps tasks awake while this process runs
+async function cmdKeepalive(s, name, all) {
+  const targets = all ? Object.keys(s.accounts) : [name];
+  for (const n of targets) {
+    const acc = s.accounts[n];
+    const ids = Object.keys(acc.tasks || {});
+    if (!ids.length) { process.stdout.write(`${n}: no saved tasks\r\n`); continue; }
+    keepaliveTimers.set(ids[ids.length - 1], startKeepalive(acc.cookie, ids, { log: true }));
+    process.stdout.write(`\x1b[32m${n}: keepalive ON for ${ids.length} task(s) — Ctrl+C to stop\x1b[0m\r\n`);
+  }
+  if (!keepaliveTimers.size) { process.stdout.write("Nothing to keep alive\r\n"); return; }
+  process.stdout.write(`\x1b[90mPulse every ${KEEPALIVE_INTERVAL / 60000} min · token-free resume signal\x1b[0m\r\n`);
+  setInterval(() => {}, 1 << 30); // keep process alive
 }
 
 // Check if a task's VM is hibernated (needs wake)
@@ -410,6 +474,15 @@ async function main() {
       if (!a || !arg1) { process.stdout.write("Usage: mc wake <task_id>\r\n"); return; }
       return cmdWake(s, s.active, arg1).catch((e) => { process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`); });
     }
+    case "keepalive": {
+      // mc keepalive        → keep ACTIVE account's tasks awake
+      // mc keepalive <n>    → keep account n's tasks awake
+      // mc keepalive all    → keep every account's tasks awake
+      const target = arg1 && s.accounts[arg1] ? arg1 : (arg1 === "all" ? undefined : (activeAccount(s) && (saveSession(s), s.active)));
+      if (arg1 === "all") return cmdKeepalive(s, null, true);
+      if (!target) { process.stdout.write("Usage: mc keepalive [account|all]\r\n"); return; }
+      return cmdKeepalive(s, target, false);
+    }
     case "check": {
       // pass [n] to check only one account, or no arg for all
       const { execSync } = require("child_process");
@@ -430,7 +503,7 @@ async function main() {
       // `mc` or `mc <account>` → connect that account's last task
       const a = activeAccount(s); saveSession(s);
       if (!a) {
-        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc connect <id>   connect a saved task\n`);
+        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc connect <id>   connect a saved task\n  mc keepalive [n|all]  keep tasks awake (no hibernation, token-free)\n`);
         return;
       }
       // `mc <name>` where <name> is an existing account → switch + connect IT
