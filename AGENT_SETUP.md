@@ -5,14 +5,14 @@
 
 ## Goal
 
-Install Node.js + Playwright, clone this repo, verify the CLI, and leave the
-user at `mc login 1` with everything working.
+Install Node.js, clone this repo, verify the CLI, and leave the user at
+`mc login 1` with everything working. **No npm packages, no Playwright,
+no browser automation** — login is paste-cookie only.
 
 ## Step 1 — Check what's already installed
 
 ```powershell
 node -v          # need v22+ (v18-21 may lack stable WebSocket)
-npm -v
 git --version
 ```
 
@@ -39,17 +39,7 @@ git clone <REPO_URL>
 cd <REPO_DIR>
 ```
 
-## Step 3 — Install Playwright (global)
-
-```powershell
-npm install -g playwright
-npx playwright install chromium
-```
-
-(Chromium download is ~150MB — give it time. If corporate proxy blocks it,
-tell the user to run `mc login <n>` and choose paste mode instead.)
-
-## Step 4 — Verify scripts
+## Step 3 — Verify scripts (no dependencies to install)
 
 ```powershell
 node --check mc_terminal.cjs
@@ -59,7 +49,7 @@ node --check mc_check.cjs
 
 All must exit 0. If any fails, stop — the files are corrupt or the wrong Node.
 
-## Step 5 — Smoke test (no login needed)
+## Step 4 — Smoke test (no login needed)
 
 ```powershell
 mc list
@@ -68,15 +58,19 @@ Expected: shows an empty/active-account listing — proves Node can run the CLI.
 
 > If `mc` is not on PATH, use `.\mc.cmd list` or `node mc_terminal.cjs list`.
 
-## Step 6 — Hand off to the user
+## Step 5 — Hand off to the user
 
-Tell them, in order:
+Login is **paste-cookie** (no browser automation). Tell them, in order:
 
 ```
-1.  mc login 1        (press Enter → Google sign-in → cookie auto-captured)
+1.  mc login 1
+    → it prints a Google sign-in URL
+    → open it in YOUR browser, sign in
+    → DevTools → Network → reload → click any api request
+    → copy the 'Cookie' request header → paste it back in the terminal
 2.  mc login 2        ...repeat for every account they want
 3.  mc check          (all should say alive)
-4.  mc                (connect terminal — Ctrl+C to exit, Ctrl+Shift+? for help)
+4.  mc                (connect terminal)
 ```
 
 ## What NOT to do
@@ -85,6 +79,7 @@ Tell them, in order:
 - ❌ Do NOT print cookies/tokens in logs or chat.
 - ❌ Do NOT log into the MonkeyCode website to "test" — website login rotates
      sessions and can kill CLI cookies.
+- ❌ Do NOT install Playwright or any npm packages — the CLI has zero deps.
 - ❌ Do NOT change the scripts' portability: `mc.cmd` uses `%~dp0` so it works
      from any folder.
 
@@ -94,9 +89,9 @@ Tell them, in order:
 |---|---|
 | `'node' is not recognized` | Node not on PATH — reopen terminal / restart PC |
 | `✗ DEAD EXPIRED` | `mc login <n>` for that account |
-| Playwright module not found | `npm install -g playwright` + `npx playwright install chromium` |
+| `✗ Couldn't find monkeycode_ai_session` | Copy the full Cookie header (or the UUID after `=`), not something else |
 | WebSocket is not defined | Node < 22 — install LTS |
-| Browser fails to open | Fall back to paste mode (option P in `mc login`) |
+| `mc` not recognized | Use `.\mc.cmd` or add the folder to PATH |
 
 ## Done
 

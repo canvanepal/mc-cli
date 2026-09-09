@@ -24,8 +24,7 @@ mc list               → all accounts + saved tasks
 
 | Tool | Why | Install |
 |---|---|---|
-| Node.js **22+** | CLI uses built-in `fetch` + `WebSocket` (zero npm deps for the core) | [nodejs.org](https://nodejs.org) LTS |
-| Playwright (global) | Only needed for `mc login` managed-browser capture | `npm install -g playwright && npx playwright install chromium` |
+| Node.js **22+** | CLI uses built-in `fetch` + `WebSocket` — zero npm dependencies | [nodejs.org](https://nodejs.org) LTS |
 
 ---
 
@@ -39,29 +38,29 @@ cd mc
 setup.cmd
 ```
 
-Installs Node (via winget if missing), Playwright, and syntax-checks everything.
+Installs Node (via winget if missing) and syntax-checks everything.
 
 ### Option B — manual
 
 ```cmd
 :: 1. Install Node 22+ from nodejs.org
-:: 2. Install Playwright
-npm install -g playwright
-npx playwright install chromium
-
-:: 3. Make mc available anywhere (optional)
+:: 2. Make mc available anywhere (optional)
 setx PATH "%PATH%;%CD%"
 ```
 
-### Then — sign in your accounts
+### Then — sign in your accounts (paste cookie)
 
 ```cmd
-mc login 1     :: [Enter] opens browser → sign in with Google → auto-captured
-mc login 2     :: repeat for each account
-mc check       :: all alive?
+mc login 1     :: prints a Google sign-in URL
 ```
 
-You can also paste a cookie manually (option P) if you prefer your own browser.
+1. Open the URL in **your browser** and sign in
+2. Copy the session cookie: DevTools → Network → reload → click any
+   `api` request → copy the **Cookie** request header
+3. Paste it back into the terminal — done (or just paste the UUID after
+   `monkeycode_ai_session=`)
+
+Repeat for each account. No browser automation, no Playwright.
 
 ---
 
@@ -79,7 +78,7 @@ You can also paste a cookie manually (option P) if you prefer your own browser.
 | `mc wake [task_id]` | Wake a hibernated VM — **token-free** (control-WS `{"type":"resume"}`) |
 | `mc check` | Cookie alive/dead + VM status (● alive / ◐ hibernated / ○ offline) |
 | `mc list` | All accounts + saved tasks |
-| `mc login <n>` | Sign in account `n` (managed browser or paste cookie) |
+| `mc login <n>` | Sign in account `n` (prints URL → paste cookie) |
 | `mc <n> wake` | Wake account n's latest task |
 
 ### Account-first forms
@@ -154,7 +153,6 @@ set MC_BUS_URL=https://your-worker.workers.dev
 | "no saved tasks" | Create one: `mc new "<prompt>"` (or `mc <n> new "..."`) |
 | VM ◐ hibernated | `mc <n>` auto-wakes (token-free) or `mc wake` |
 | Terminal 503 / VM offline | Wake first: `mc wake <task_id>`, then connect |
-| Playwright not found | `npm install -g playwright && npx playwright install chromium` |
 | Cookie died after website login | Server rotated sessions — re-login via `mc login <n>` |
 
 ---
@@ -166,7 +164,7 @@ mc/
 ├── mc.cmd                  # Windows launcher (portable %~dp0)
 ├── setup.cmd               # one-click setup
 ├── mc_terminal.cjs         # main CLI (terminal, tasks, wake)
-├── mc_login.cjs            # OAuth login (managed browser or paste)
+├── mc_login.cjs            # OAuth login (prints URL → paste cookie)
 ├── mc_check.cjs            # cookie + VM health checker
 ├── mc_agent_msg.cjs        # agent-to-agent message helper
 ├── mc_agent_bus_SKILL.md   # agent skill: inter-VM protocol
