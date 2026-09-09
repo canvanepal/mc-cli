@@ -1,0 +1,27 @@
+# 🔒 Session files (contain live auth cookies) — NEVER commit
+mc_session.json
+*.session.json
+
+# Node
+node_modules/
+package-lock.json
+
+# Wrangler
+.wrangler/
+.dev.vars
+
+# Local env
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Reverse-engineered chunks (large, not source)
+mc_chunks/
+js_chunks/

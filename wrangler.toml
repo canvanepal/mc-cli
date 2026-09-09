@@ -1,0 +1,13 @@
+# Template — replace the KV namespace id with your own before deploying.
+#   wrangler kv namespace create MC_KV
+# then paste the returned id below.
+name = "mc-worker"
+main = "mc_worker.js"
+compatibility_date = "2025-01-01"
+
+kv_namespaces = [
+  { binding = "KV", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+[triggers]
+crons = ["0 */6 * * *"]   # every 6 hours
