@@ -107,6 +107,7 @@ async function createTask(cookie, content) {
 /* ---------------- terminal connection (shared) ---------------- */
 
 let ws, pingInterval, attempt = 0, gotConnected = false, lastRx = 0, healthTimer = null, currentTaskId = null;
+let downSince = null, bannerTimer = null;
 
 const enc = (s) => Buffer.from(s, "utf8").toString("base64");
 const dec = (b) => Buffer.from(b, "base64").toString("utf8");
@@ -121,6 +122,33 @@ function sendResize() {
   }
 }
 
+const fmtSecs = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${s}s`);
+
+// Live downtime banner: redraws in place every second until the socket is back.
+function startDownBanner() {
+  if (downSince === null) downSince = Date.now();
+  clearInterval(bannerTimer);
+  const label = gotConnected ? "Reconnecting" : "Connecting";
+  const render = () => {
+    const s = Math.floor((Date.now() - downSince) / 1000);
+    process.stdout.write(`\r\x1b[K\x1b[33m── ${label}… down ${fmtSecs(s)} (attempt ${attempt}) ──\x1b[0m`);
+  };
+  render();
+  bannerTimer = setInterval(render, 1000);
+}
+
+// Clears the banner. back=true prints the "back online" summary line.
+function stopDownBanner(back) {
+  clearInterval(bannerTimer);
+  bannerTimer = null;
+  if (downSince !== null) {
+    const s = Math.floor((Date.now() - downSince) / 1000);
+    downSince = null;
+    if (back) process.stdout.write(`\r\x1b[K\x1b[32m── Back online — was down ${fmtSecs(s)} ──\x1b[0m\r\n`);
+    else process.stdout.write(`\r\x1b[K`);
+  }
+}
+
 async function connectTerminal(cookie, vmId, terminalId) {
   const url = `${WS_BASE}/${vmId}/terminals/connect?terminal_id=${encodeURIComponent(terminalId)}`;
   ws = new WebSocket(url, { headers: cookie ? { Cookie: cookie } : {} });
@@ -129,6 +157,7 @@ async function connectTerminal(cookie, vmId, terminalId) {
   ws.onopen = () => {
     attempt = 0;
     lastRx = Date.now();
+    stopDownBanner(true);
     sendResize();
     clearInterval(pingInterval);
     pingInterval = setInterval(() => send({ type: "ping" }), 5000);
@@ -170,6 +199,7 @@ async function connectTerminal(cookie, vmId, terminalId) {
     const clean = ev.code === 1000;
     const task = currentTaskId;
     if (clean) {
+      stopDownBanner(false);
       process.stdout.write(`\r\n\x1b[90m── Session closed ──\x1b[0m\r\n`);
       cleanup();
       setImmediate(() => process.exit(0)); // setImmediate: exit AFTER ws teardown (UV win/async fix)
@@ -180,6 +210,7 @@ async function connectTerminal(cookie, vmId, terminalId) {
     // or a VM mid-hibernate looks identical to a dead task at this layer.
     const deadTask = ev.code === 4404 || /not.?found|no such|dead|destroyed/i.test(ev.reason || "");
     if (!gotConnected && deadTask) {
+      stopDownBanner(false);
       process.stdout.write(`\r\n\x1b[31mConnection failed (${ev.code}${ev.reason ? ": " + ev.reason : ""}) — task VM may be dead. Try: mc new \"<prompt>\"\x1b[0m\r\n`);
       cleanup();
       setImmediate(() => process.exit(1));
@@ -190,7 +221,7 @@ async function connectTerminal(cookie, vmId, terminalId) {
     const delay = [1000, 2000, 4000, 8000][Math.min(attempt, 3)] || 15000;
     if (attempt >= 4) attempt = 4;
     else attempt++;
-    process.stdout.write(`\r\n\x1b[33m── Reconnecting (${Math.round(delay / 1000)}s) ──\x1b[0m\r\n`);
+    startDownBanner();
     setTimeout(async () => {
       try {
         // If the VM dropped into hibernation/sleep while we were offline,
@@ -235,6 +266,7 @@ function startConnectWatchdog(cookie, taskId) {
 function cleanup() {
   clearInterval(pingInterval);
   clearInterval(healthTimer);
+  clearInterval(bannerTimer);
   try { ws && ws.close(); } catch {}
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
   try { process.stdin.pause(); } catch {}
@@ -660,7 +692,7 @@ process.stdout.write("\x1b[2J\x1b[H");
 // whole CLI — treat it as a reconnect case instead (onclose handles the retry).
 process.on("uncaughtException", (e) => {
   if (e && (e.code === "ECONNRESET" || e.code === "EPIPE")) {
-    process.stdout.write(`\r\n\x1b[33m── Network reset (${e.code}) — reconnecting… ──\x1b[0m\r\n`);
+    process.stdout.write(`\r\n\x1b[33m── Network reset (${e.code}) ──\x1b[0m\r\n`);
     try { ws && ws.terminate(); } catch {} // force onclose → retry loop
     return;
   }
