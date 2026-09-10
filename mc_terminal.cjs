@@ -538,24 +538,50 @@ async function cmdStop(s, name, taskId) {
   }
 }
 
-function cmdList(s) {
+// Probe server status for a batch of task ids (parallel).
+async function taskStatuses(cookie, ids) {
+  const out = {};
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const d = await api("GET", `/users/tasks/${id}`, { cookie });
+      out[id] = d?.status || "?";
+    } catch { out[id] = "?"; } // unknown → keep, never delete blindly
+  }));
+  return out;
+}
+
+async function cmdList(s) {
   const names = Object.keys(s.accounts || {});
   if (!names.length) {
     process.stdout.write("No accounts. Run: mc login 1\r\n");
     return;
   }
-  process.stdout.write(`Accounts (${names.length}):\r\n`);
-  names.forEach((n, i) => {
+  // Probe live status for every saved task (parallel) so stale local entries
+  // get marked instead of silently showing as connectable.
+  const rows = await Promise.all(names.map(async (n) => {
     const a = s.accounts[n];
-    const tasks = Object.keys(a.tasks || {});
+    const ids = Object.keys(a.tasks || {});
+    return { n, a, ids, st: ids.length ? await taskStatuses(a.cookie, ids) : {} };
+  }));
+  process.stdout.write(`Accounts (${names.length}):\r\n`);
+  for (const { n, a, ids, st } of rows) {
     const mark = n === s.active ? " *" : "";
     const saved = a.saved_at ? " · " + new Date(a.saved_at).toLocaleString(undefined, { month: "short", day: "numeric" }) : "";
-    process.stdout.write(`  [${i + 1}] ${n}${mark}${saved}  (${tasks.length} task${tasks.length === 1 ? "" : "s"})\r\n`);
-    for (const tid of tasks) {
-      process.stdout.write(`       ${tid.slice(0, 8)}  ${(a.tasks[tid].title || "").slice(0, 50)}\r\n`);
+    process.stdout.write(`  [${names.indexOf(n) + 1}] ${n}${mark}${saved}  (${ids.length} task${ids.length === 1 ? "" : "s"})\r\n`);
+    for (const tid of ids) {
+      const stt = st[tid];
+      const tag = stt === undefined ? ""
+        : TERMINAL_STATES.has(stt) ? `\x1b[90m[${stt} — prune]\x1b[0m`
+        : (stt === "processing" || stt === "pending") ? `\x1b[32m[${stt}]\x1b[0m`
+        : `\x1b[33m[${stt}]\x1b[0m`;
+      process.stdout.write(`       ${tid.slice(0, 8)}  ${(a.tasks[tid].title || "").slice(0, 40)}  ${tag}\r\n`);
     }
-  });
-  process.stdout.write(`Use: mc <n> · mc login <n> · mc new \"<prompt>\" · mc tasks\r\n`);
+    const def = a.last_task || ids[ids.length - 1];
+    if (def && st[def] && TERMINAL_STATES.has(st[def])) {
+      process.stdout.write(`       \x1b[33m⚠ default task ${def.slice(0, 8)} is ${st[def]} — fix: mc prune ${n}\x1b[0m\r\n`);
+    }
+  }
+  process.stdout.write(`Use: mc <n> · mc login <n> · mc new "<prompt>" · mc tasks · mc prune\r\n`);
 }
 
 /* ---------------- main ---------------- */
@@ -572,7 +598,35 @@ async function main() {
   }
 
   switch (cmd) {
-    case "list": return cmdList(s);
+    case "list": await cmdList(s); return;
+    case "prune": {
+      // mc prune [n] — reconcile local session with server task state.
+      // Keeps running tasks, removes finished/failed/stopped ones, repairs last_task.
+      const targets = arg1 && s.accounts[arg1] ? [arg1] : Object.keys(s.accounts);
+      if (!targets.length) { process.stdout.write("No accounts. Run: mc login 1\r\n"); return; }
+      for (const n of targets) {
+        const a = s.accounts[n];
+        const ids = Object.keys(a.tasks || {});
+        if (!ids.length) { process.stdout.write(`  ${n.padEnd(4)} no saved tasks\r\n`); continue; }
+        const st = await taskStatuses(a.cookie, ids);
+        const removed = [];
+        for (const id of ids) {
+          if (TERMINAL_STATES.has(st[id])) {
+            delete a.tasks[id];
+            if (a.last_task === id) a.last_task = null;
+            removed.push(`${id.slice(0, 8)} [${st[id]}]`);
+          }
+        }
+        // point last_task at a still-running task if the default died
+        const remaining = Object.keys(a.tasks || {});
+        if (!a.last_task && remaining.length) a.last_task = remaining[remaining.length - 1];
+        saveSession(s);
+        process.stdout.write(removed.length
+          ? `  ${n.padEnd(4)} pruned: ${removed.join(", ")} — kept: ${remaining.map((x) => x.slice(0, 8)).join(", ") || "none"}\r\n`
+          : `  ${n.padEnd(4)} clean (${remaining.length} task${remaining.length === 1 ? "" : "s"}, nothing to prune)\r\n`);
+      }
+      return;
+    }
     case "use": {
       if (!s.accounts[arg1]) { process.stdout.write(`No account '${arg1}'. Run: mc login ${arg1}\r\n`); return; }
       s.active = arg1; saveSession(s);
@@ -677,7 +731,7 @@ async function main() {
       // `mc` or `mc <account>` → connect that account's last task
       const a = activeAccount(s); saveSession(s);
       if (!a) {
-        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc connect <id>   connect a saved task\n  mc keepalive [n|all]  keep tasks awake (no hibernation, token-free)\n  mc sync [n|all]     push cookies to worker KV (cron keepalive + wake coverage)\n`);
+        process.stdout.write(`MonkeyCode CLI — per-task terminals.\n\nCommands:\n  mc login <n>      sign in account n (opens browser)\n  mc list           show accounts + tasks\n  mc <n>            connect account n's last task\n  mc new \"<prompt>\"  create a task on active account and open its terminal\n  mc tasks          list active account's tasks\n  mc stop <id>      stop a task (destroys its VM)\n  mc prune [n]      remove finished/zombie tasks from local session\n  mc connect <id>   connect a saved task\n  mc keepalive [n|all]  keep tasks awake (no hibernation, token-free)\n  mc sync [n|all]     push cookies to worker KV (cron keepalive + wake coverage)\n`);
         return;
       }
       // `mc <name>` where <name> is an existing account → switch + connect IT
