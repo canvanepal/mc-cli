@@ -27,7 +27,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const WS_BASE = "wss://monkeycode-ai.net/api/v1/users/hosts/vms";
+const WS_BASE = process.env.MC_WS_BASE_OVERRIDE || "wss://monkeycode-ai.net/api/v1/users/hosts/vms";
 const API = "https://monkeycode-ai.net/api/v1";
 const SESSION_FILE = path.join(__dirname, "mc_session.json");
 
@@ -106,7 +106,7 @@ async function createTask(cookie, content) {
 
 /* ---------------- terminal connection (shared) ---------------- */
 
-let ws, pingInterval, attempt = 0, gotConnected = false;
+let ws, pingInterval, attempt = 0, gotConnected = false, lastRx = 0, healthTimer = null, currentTaskId = null;
 
 const enc = (s) => Buffer.from(s, "utf8").toString("base64");
 const dec = (b) => Buffer.from(b, "base64").toString("utf8");
@@ -128,15 +128,28 @@ async function connectTerminal(cookie, vmId, terminalId) {
 
   ws.onopen = () => {
     attempt = 0;
+    lastRx = Date.now();
     sendResize();
     clearInterval(pingInterval);
     pingInterval = setInterval(() => send({ type: "ping" }), 5000);
+    // Health watchdog: server going silent while the socket LOOKS open
+    // (half-open TCP after wifi drop / sleep) would hang forever — detect
+    // no inbound traffic for 25s, force-close, and let onclose reconnect.
+    clearInterval(healthTimer);
+    healthTimer = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN && Date.now() - lastRx > 25000) {
+        process.stdout.write(`\r\n\x1b[33m── Connection looks dead (no data 25s) — forcing reconnect ──\x1b[0m\r\n`);
+        try { ws.terminate(); } catch {}
+      }
+    }, 5000);
   };
   ws.onmessage = (ev) => {
+    lastRx = Date.now();
     let msg;
     try { msg = JSON.parse(String(ev.data)); } catch { process.stdout.write(String(ev.data)); return; }
     switch (msg.type) {
       case "data":
+        gotConnected = true; // shell output flowing = healthy session
         try { process.stdout.write(dec(msg.data)); } catch { process.stdout.write(String(msg.data)); }
         break;
       case "connected":
@@ -153,21 +166,75 @@ async function connectTerminal(cookie, vmId, terminalId) {
   };
   ws.onclose = (ev) => {
     clearInterval(pingInterval);
-    if (!gotConnected && ev.code !== 1000) {
+    clearInterval(healthTimer);
+    const clean = ev.code === 1000;
+    const task = currentTaskId;
+    if (clean) {
+      process.stdout.write(`\r\n\x1b[90m── Session closed ──\x1b[0m\r\n`);
+      cleanup();
+      setImmediate(() => process.exit(0)); // setImmediate: exit AFTER ws teardown (UV win/async fix)
+      return;
+    }
+    // First connect never succeeded + explicit reject = task/VM is really gone.
+    // Transient codes (1006 etc.) still fall through to retry — a network drop
+    // or a VM mid-hibernate looks identical to a dead task at this layer.
+    const deadTask = ev.code === 4404 || /not.?found|no such|dead|destroyed/i.test(ev.reason || "");
+    if (!gotConnected && deadTask) {
       process.stdout.write(`\r\n\x1b[31mConnection failed (${ev.code}${ev.reason ? ": " + ev.reason : ""}) — task VM may be dead. Try: mc new \"<prompt>\"\x1b[0m\r\n`);
       cleanup();
-      process.exit(1);
+      setImmediate(() => process.exit(1));
+      return;
     }
-    const delay = [1000, 2000, 4000, 8000][Math.min(attempt, 3)];
-    attempt++;
+    // Cap the attempt counter so retries never stop and delays stay bounded.
+    // attempt 0-3 → 1/2/4/8s, then 15s forever.
+    const delay = [1000, 2000, 4000, 8000][Math.min(attempt, 3)] || 15000;
+    if (attempt >= 4) attempt = 4;
+    else attempt++;
     process.stdout.write(`\r\n\x1b[33m── Reconnecting (${Math.round(delay / 1000)}s) ──\x1b[0m\r\n`);
-    setTimeout(() => connectTerminal(cookie, vmId, terminalId), delay);
+    setTimeout(async () => {
+      try {
+        // If the VM dropped into hibernation/sleep while we were offline,
+        // the terminal WS will never answer — wake it first (token-free),
+        // then reconnect. isTaskHibernated is cheap; only check after a
+        // few failed tries so a quick blip doesn't add an API round-trip.
+        if (attempt >= 2 && task && cookie) {
+          try {
+            if (await isHibernated(cookie, task)) {
+              process.stdout.write(`\x1b[33mVM hibernated while offline — waking…\x1b[0m\r\n`);
+              await wakeTask(cookie, task);
+            }
+          } catch {}
+        }
+        await connectTerminal(cookie, vmId, terminalId);
+      } catch {}
+    }, delay);
   };
-  ws.onerror = (e) => { if (!gotConnected) process.stdout.write(`\r\n\x1b[31mWebSocket error\x1b[0m\r\n`); };
+  ws.onerror = (e) => { if (!gotConnected) process.stdout.write(`\r\n\x1b[31mWebSocket error — retrying…\x1b[0m\r\n`); };
+}
+
+// Backstop for the pathological case: WS neither opens NOR closes (network
+// black hole). Poll task status over HTTP; the moment the VM reports online
+// (or 20s pass, whichever first), force the pending socket closed so
+// onclose's retry loop takes over.
+function startConnectWatchdog(cookie, taskId) {
+  const t0 = Date.now();
+  const iv = setInterval(async () => {
+    if (ws && ws.readyState !== WebSocket.CONNECTING) { clearInterval(iv); return; }
+    let online = false;
+    try {
+      online = !(await isHibernated(cookie, taskId)); // false only when confirmed hibernated
+      if (Date.now() - t0 > 20000) online = true; // give up waiting, let WS retry loop run
+    } catch { online = Date.now() - t0 > 20000; }
+    if (online && ws && ws.readyState === WebSocket.CONNECTING) {
+      clearInterval(iv);
+      try { ws.terminate(); } catch {}
+    }
+  }, 4000);
 }
 
 function cleanup() {
   clearInterval(pingInterval);
+  clearInterval(healthTimer);
   try { ws && ws.close(); } catch {}
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
   try { process.stdin.pause(); } catch {}
@@ -194,6 +261,7 @@ function attachStdin() {
 async function cmdConnectTask(account, taskId) {
   const t = (account.tasks || {})[taskId];
   if (!t) throw new Error(`No saved task ${taskId}. Run: mc tasks`);
+  currentTaskId = taskId; // used by the reconnect loop for wake-on-reconnect
   process.stdout.write(`\x1b[36mConnecting to task ${taskId.slice(0, 8)}…\x1b[0m\r\n`);
 
   // auto-wake if VM is hibernated — token-free control signal (no chat)
@@ -255,6 +323,7 @@ async function cmdNew(s, name, content) {
   account.tasks[id].vm_id = vmId;
   saveSession(s);
   process.stdout.write(`\x1b[36mVM ready (${vmId.slice(0, 20)}…) — connecting terminal…\x1b[0m\r\n`);
+  startConnectWatchdog(account.cookie, id); // network black-hole backstop during first connect
   await cmdConnectTask(account, id);
 }
 
@@ -486,11 +555,12 @@ async function main() {
     case "sync": {
       // mc sync [n|all] — push local cookie(s) into the worker KV so the
       // cron keepalive + wake endpoints cover them. `all` is the default.
-      // Worker URL comes from env (MC_WORKER_URL) or mc_worker_url.txt next to the script —
-      // no personal URLs in the repo. Set once:  setx MC_WORKER_URL https://<your-worker>.workers.dev
+      // Worker URL: set MC_WORKER_URL env var, or drop a gitignored mc_worker_url.txt
       const WORKER_URL = process.env.MC_WORKER_URL
-        || (() => { try { return require("fs").readFileSync(path.join(__dirname, "mc_worker_url.txt"), "utf8").trim(); } catch { return null; } })();
-      if (!WORKER_URL) { process.stdout.write("No worker URL. Set MC_WORKER_URL env var or mc_worker_url.txt (see README)\r\n"); return; }
+        || (require("fs").existsSync(require("path").join(__dirname, "mc_worker_url.txt"))
+          ? require("fs").readFileSync(require("path").join(__dirname, "mc_worker_url.txt"), "utf8").trim()
+          : "");
+      if (!WORKER_URL) { process.stdout.write("Worker URL not set (MC_WORKER_URL or mc_worker_url.txt)\r\n"); return; }
       const targets = (!arg1 || arg1 === "all") ? Object.keys(s.accounts) : (s.accounts[arg1] ? [arg1] : null);
       if (!targets) { process.stdout.write(`No account '${arg1}'\r\n`); return; }
       process.stdout.write(`Syncing ${targets.length} account(s) → worker KV…\r\n`);
@@ -586,4 +656,16 @@ async function main() {
 }
 
 process.stdout.write("\x1b[2J\x1b[H");
+// A hard TCP reset on the WS can surface as an unhandled ECONNRESET and kill the
+// whole CLI — treat it as a reconnect case instead (onclose handles the retry).
+process.on("uncaughtException", (e) => {
+  if (e && (e.code === "ECONNRESET" || e.code === "EPIPE")) {
+    process.stdout.write(`\r\n\x1b[33m── Network reset (${e.code}) — reconnecting… ──\x1b[0m\r\n`);
+    try { ws && ws.terminate(); } catch {} // force onclose → retry loop
+    return;
+  }
+  process.stdout.write(`\r\n\x1b[31mUnexpected error: ${e && e.stack ? e.stack.split("\n")[0] : e}\x1b[0m\r\n`);
+  cleanup();
+  setImmediate(() => process.exit(1));
+});
 main();

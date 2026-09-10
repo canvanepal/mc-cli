@@ -21,6 +21,17 @@ function loadSession() {
   catch { return { active: null, accounts: {} }; }
 }
 
+// ms → "2d 3h 12m" / "4h 5m" / "38m"
+function fmtUptime(ms) {
+  const m = Math.floor(ms / 60000);
+  const d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
+  const parts = [];
+  if (d) parts.push(d + "d");
+  if (h) parts.push(h + "h");
+  parts.push((m % 60) + "m");
+  return parts.join(" ");
+}
+
 async function checkAccount(name, cookie) {
   const started = Date.now();
   try {
@@ -41,8 +52,8 @@ async function checkAccount(name, cookie) {
     const user = j.data?.user || {};
     const email = user.email || "?";
     const plan = "—"; // subscription endpoint needed
-    // quick task count + real VM status of the latest task
-    let tasks = "?", vm = null;
+    // quick task count + real VM status/uptime of the newest task
+    let tasks = "?", vm = null, up = null;
     try {
       const tr = await fetch(`${API}/users/tasks?page=1&size=5`, {
         headers: { Cookie: cookie, Accept: "application/json", Origin: "https://monkeycode-ai.net" },
@@ -52,7 +63,7 @@ async function checkAccount(name, cookie) {
         const all = tj.data?.tasks || [];
         const active = all.filter(t => t.status === "pending" || t.status === "processing").length;
         tasks = `${active} running / ${all.length} total`;
-        // fetch detail of newest task for VM status
+        // fetch detail of newest task for VM status + uptime
         const newest = all[0];
         if (newest) {
           const dr = await fetch(`${API}/users/tasks/${newest.id}`, {
@@ -61,13 +72,18 @@ async function checkAccount(name, cookie) {
           const dj = await dr.json();
           if (dj.code === 0 && dj.data?.virtualmachine) {
             const v = dj.data.virtualmachine;
-            const hib = (v.conditions || []).some(c => c.type === "Hibernated" && c.status === 2);
+            const hibCond = (v.conditions || []).find(c => c.type === "Hibernated");
+            const hib = hibCond && hibCond.status === 2;
             vm = v.status === "online" ? "alive" : (hib ? "hibernated" : (v.status || "offline"));
+            // uptime = now - last wake (Hibernated condition's last_transition_time is epoch ms
+            // of the most recent wake; on a never-hibernated VM it's the boot time)
+            const since = hibCond?.last_transition_time;
+            if (since) up = fmtUptime(Math.max(0, Date.now() - since));
           }
         }
       }
     } catch {}
-    return { ok: true, email, tasks, vm, ms: latency };
+    return { ok: true, email, tasks, vm, up, ms: latency };
   } catch (e) {
     return { ok: false, status: 0, label: e.message, ms: Date.now() - started };
   }
@@ -95,7 +111,8 @@ async function main() {
     if (r.ok) {
       const vmDot = r.vm === "alive" ? "\x1b[32m●\x1b[0m" : (r.vm === "hibernated" ? "\x1b[33m◐\x1b[0m" : "\x1b[90m○\x1b[0m");
       const vmTxt = r.vm ? `${vmDot} ${r.vm}` : "";
-      process.stdout.write(`${dot}  ${name.padEnd(4)} alive  ${r.email}  VM: ${vmTxt}  tasks: ${r.tasks}  (${r.ms}ms)\n`);
+      const upTxt = r.up ? ` up ${r.up}` : "";
+      process.stdout.write(`${dot}  ${name.padEnd(4)} alive  ${r.email}  VM: ${vmTxt}${upTxt}  tasks: ${r.tasks}  (${r.ms}ms)\n`);
     } else {
       process.stdout.write(`${dot}  ${name.padEnd(4)} DEAD   ${r.label}  (${r.ms}ms)\n`);
     }
