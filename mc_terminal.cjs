@@ -62,7 +62,20 @@ async function api(method, p, { cookie, body } = {}) {
   const j = await res.json().catch(() => ({}));
   if (!res.ok || (j.code !== undefined && j.code !== 0)) {
     if (j.code === 10811) {
-      throw new Error("Concurrency limit reached — you already have a running task. Stop it first: mc stop <task_id>");
+      // Free-tier concurrency limit — find WHICH task is holding the slot.
+      let blocker = "";
+      try {
+        const lr = await fetch(`${API}/users/tasks?page=1&size=5`, { headers });
+        const lj = await lr.json();
+        const run = (lj.data?.tasks || []).find((t) => t.status === "processing" || t.status === "pending");
+        if (run) blocker = ` (blocking: ${run.id.slice(0, 8)} — "${(run.title || run.content || "").slice(0, 40)}")`;
+      } catch {}
+      throw new Error(
+        `Concurrency limit reached — you already have a running task${blocker}.\r\n` +
+        `  Stop it:        mc stop <task_id>\r\n` +
+        `  Or reconnect:   mc connect <task_id>\r\n` +
+        `  Then create:    mc new "<prompt>"`
+      );
     }
     throw new Error(j.message || `API ${method} ${p} failed (${res.status})`);
   }
@@ -290,10 +303,26 @@ function attachStdin() {
 
 /* ---------------- commands ---------------- */
 
+const TERMINAL_STATES = new Set(["finished", "failed", "stopped", "completed"]);
+
 async function cmdConnectTask(account, taskId) {
   const t = (account.tasks || {})[taskId];
   if (!t) throw new Error(`No saved task ${taskId}. Run: mc tasks`);
   currentTaskId = taskId; // used by the reconnect loop for wake-on-reconnect
+  // Refuse terminal states up front — the platform archives their VMs and will
+  // never resume them (wake times out, terminals endpoint 500s).
+  try {
+    const d = await api("GET", `/users/tasks/${taskId}`, { cookie: account.cookie });
+    if (d?.status && TERMINAL_STATES.has(d.status)) {
+      throw new Error(
+        `Task ${taskId.slice(0, 8)} is ${d.status} — its VM is archived and can't be reconnected.\r\n` +
+        `  Start a fresh one: mc new "<prompt>"`
+      );
+    }
+  } catch (e) {
+    if (/archived and can't be reconnected/.test(e.message)) throw e; // our refusal
+    // status probe failed (network etc.) — fall through, legacy flow handles it
+  }
   process.stdout.write(`\x1b[36mConnecting to task ${taskId.slice(0, 8)}…\x1b[0m\r\n`);
 
   // auto-wake if VM is hibernated — token-free control signal (no chat)
@@ -316,7 +345,10 @@ async function cmdConnectTask(account, taskId) {
   try {
     terminals = await getTaskTerminals(account.cookie, t.vm_id);
   } catch (e) {
-    throw new Error(`${e.message} — task VM is gone. Create a new one: mc new "<prompt>"`);
+    throw new Error(
+      `${e.message} — task VM is unreachable.\r\n` +
+      `  If it's stuck 'processing': mc stop ${taskId.slice(0, 8)} then mc new "<prompt>"`
+    );
   }
   // Terminals are client-generated (randomUUID) — if none exist, create one
   // like the web UI does: just pick an ID and connect via WS
@@ -490,9 +522,17 @@ async function cmdTasks(s, name) {
 }
 
 async function cmdStop(s, name, taskId) {
+  const acc = s.accounts[name];
+  // accept ID prefixes — resolve against locally saved tasks
+  const full = (Object.keys(acc.tasks || {}).find((k) => k.startsWith(taskId))) || taskId;
   try {
-    await api("PUT", "/users/tasks/stop", { cookie: s.accounts[name].cookie, body: { id: taskId } });
-    process.stdout.write(`Stopped ${taskId.slice(0, 8)} (VM will be destroyed)\r\n`);
+    await api("PUT", "/users/tasks/stop", { cookie: acc.cookie, body: { id: full } });
+    process.stdout.write(`Stopped ${full.slice(0, 8)} (VM will be destroyed)\r\n`);
+    stopKeepalive(full); // no more pulses at a dead task
+    delete acc.tasks[full];
+    if (acc.last_task === full) acc.last_task = null;
+    saveSession(s);
+    process.stdout.write(`Free slot ready — create a new task: mc new "<prompt>" ${name}\r\n`);
   } catch (e) {
     process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`);
   }
