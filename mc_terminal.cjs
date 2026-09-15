@@ -28,7 +28,13 @@ const fs = require("fs");
 const path = require("path");
 
 const WS_BASE = process.env.MC_WS_BASE_OVERRIDE || "wss://monkeycode-ai.net/api/v1/users/hosts/vms";
-const API = "https://monkeycode-ai.net/api/v1";
+const API = process.env.MC_API_BASE_OVERRIDE || "https://monkeycode-ai.net/api/v1";
+// After a fresh `mc new`, the VM object can exist (status online, Ready) while
+// the in-VM terminal service is still booting — the terminals endpoint then
+// 500s (服务器错误). Retry through that boot window instead of failing the whole
+// `mc new` flow and leaving a healthy task orphaned.
+const BOOT_GRACE_MS = Number(process.env.MC_BOOT_GRACE_MS || 120000); // retry terminals for up to 2 min
+const BOOT_GRACE_POLL = Number(process.env.MC_BOOT_GRACE_POLL || 5000);
 const SESSION_FILE = path.join(__dirname, "mc_session.json");
 
 /* ---------------- session store (multi-account) ---------------- */
@@ -84,6 +90,26 @@ async function api(method, p, { cookie, body } = {}) {
 
 async function getTaskTerminals(cookie, vmId) {
   return await api("GET", `/users/hosts/vms/${vmId}/terminals`, { cookie });
+}
+
+// Fetch a task's terminals, retrying through the fresh-VM boot window (the
+// terminals endpoint 500s while the in-VM service is still coming up).
+// Only 5xx-style server errors are retried; auth/network errors fail fast.
+// `say` receives progress lines; throws the last error if the grace expires.
+async function getTerminalsWithBootGrace(cookie, vmId, say) {
+  const deadline = Date.now() + BOOT_GRACE_MS;
+  while (true) {
+    try {
+      return await getTaskTerminals(cookie, vmId);
+    } catch (e) {
+      const msg = String(e.message || e);
+      const serverSide = /500|HTTP 5|failed \(5\d\d\)|服务器/.test(msg);
+      if (!(Date.now() < deadline && serverSide)) throw e;
+      const left = Math.round((deadline - Date.now()) / 1000);
+      if (say) say(`VM terminal service is still booting (${msg.slice(0, 60)}) — retrying for up to ${left}s…`);
+      await new Promise((r) => setTimeout(r, BOOT_GRACE_POLL));
+    }
+  }
 }
 
 async function createTask(cookie, content) {
@@ -343,7 +369,8 @@ async function cmdConnectTask(account, taskId) {
 
   let terminals;
   try {
-    terminals = await getTaskTerminals(account.cookie, t.vm_id);
+    terminals = await getTerminalsWithBootGrace(account.cookie, t.vm_id, (m) =>
+      process.stdout.write(`\x1b[33m${m}\x1b[0m\r\n`));
   } catch (e) {
     throw new Error(
       `${e.message} — task VM is unreachable.\r\n` +
@@ -682,11 +709,8 @@ async function main() {
       // mc sync [n|all] — push local cookie(s) into the worker KV so the
       // cron keepalive + wake endpoints cover them. `all` is the default.
       // Worker URL: set MC_WORKER_URL env var, or drop a gitignored mc_worker_url.txt
-      const WORKER_URL = process.env.MC_WORKER_URL
-        || (require("fs").existsSync(require("path").join(__dirname, "mc_worker_url.txt"))
-          ? require("fs").readFileSync(require("path").join(__dirname, "mc_worker_url.txt"), "utf8").trim()
-          : "");
-      if (!WORKER_URL) { process.stdout.write("Worker URL not set (MC_WORKER_URL or mc_worker_url.txt)\r\n"); return; }
+const WORKER_URL = process.env.MC_WORKER_URL
+  || (fs.existsSync(__dirname + "/mc_worker_url.txt") ? fs.readFileSync(__dirname + "/mc_worker_url.txt", "utf8").trim() : null);
       const targets = (!arg1 || arg1 === "all") ? Object.keys(s.accounts) : (s.accounts[arg1] ? [arg1] : null);
       if (!targets) { process.stdout.write(`No account '${arg1}'\r\n`); return; }
       process.stdout.write(`Syncing ${targets.length} account(s) → worker KV…\r\n`);
