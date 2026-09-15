@@ -331,6 +331,57 @@ function attachStdin() {
 
 const TERMINAL_STATES = new Set(["finished", "failed", "stopped", "completed"]);
 
+// Resolve which task a bare `mc <n>` should attach to. Prefers a live task
+// (pending/processing) from the SERVER over the locally saved pointer — the
+// pointer goes stale when tasks finish or a new one is created elsewhere.
+// Falls back to the saved pointer only when the server is unreachable.
+// Returns { id, note } — note explains a pointer repair or fallback.
+async function resolveDefaultTask(s, acc) {
+  const saved = acc.last_task;
+  try {
+    const data = await api("GET", "/users/tasks", { cookie: acc.cookie });
+    const all = data.tasks || [];
+    const live = all.filter((t) => t.status === "pending" || t.status === "processing");
+    const pick = live[0] || null;
+    if (pick) {
+      // ensure we have the task cached with vm_id
+      acc.tasks = acc.tasks || {};
+      if (!acc.tasks[pick.id] || !acc.tasks[pick.id].vm_id) {
+        try {
+          const detail = await api("GET", `/users/tasks/${pick.id}`, { cookie: acc.cookie });
+          acc.tasks[pick.id] = {
+            title: (pick.content || "").slice(0, 60),
+            vm_id: detail?.virtualmachine?.id || acc.tasks[pick.id]?.vm_id || null,
+            terminal_id: acc.tasks[pick.id]?.terminal_id || null,
+            created: pick.created_at ? new Date(pick.created_at * 1000).toISOString() : new Date().toISOString(),
+          };
+        } catch {}
+      }
+      const note = saved && saved !== pick.id ? `pointer stale — saved task ${saved.slice(0, 8)} is finished; connecting to live task ${pick.id.slice(0, 8)} instead` : null;
+      acc.last_task = pick.id;
+      saveSession(s);
+      return { id: pick.id, note };
+    }
+    // server says nothing is live
+    if (saved && acc.tasks[saved]) {
+      // fall back to the saved pointer only if it's NOT a known-terminal task
+      const d = await api("GET", `/users/tasks/${saved}`, { cookie: acc.cookie }).catch(() => null);
+      if (d?.status && TERMINAL_STATES.has(d.status)) {
+        acc.last_task = null;
+        saveSession(s);
+        throw new Error(`Task ${saved.slice(0, 8)} is finished — its VM is archived and can't be reconnected.\r\n  Start a fresh one: mc new "<prompt>"`);
+      }
+      return { id: saved, note: null };
+    }
+    throw new Error(`No live tasks on the server. Create one: mc new "<prompt>"`);
+  } catch (e) {
+    // network/API failure → legacy behavior: saved pointer, no verification
+    if (/finished — its VM is archived/.test(String(e.message)) || /No live tasks/.test(String(e.message))) throw e;
+    if (saved && acc.tasks[saved]) return { id: saved, note: `server unreachable — using saved pointer ${saved.slice(0, 8)}` };
+    throw new Error(`Server unreachable and no saved tasks. Create one: mc new "<prompt>"`);
+  }
+}
+
 async function cmdConnectTask(account, taskId) {
   const t = (account.tasks || {})[taskId];
   if (!t) throw new Error(`No saved task ${taskId}. Run: mc tasks`);
@@ -393,6 +444,7 @@ async function cmdNew(s, name, content) {
   const { id } = await createTask(account.cookie, content);
   account.tasks = account.tasks || {};
   account.tasks[id] = { title: content.slice(0, 60), vm_id: null, terminal_id: null, created: new Date().toISOString() };
+  account.last_task = id; // the task just created IS the default connect target
   saveSession(s);
   process.stdout.write(`\x1b[36mTask ${id.slice(0, 8)} created — waiting for VM…\x1b[0m\r\n`);
 
@@ -688,7 +740,28 @@ async function main() {
       const a = activeAccount(s); saveSession(s);
       if (!a || !arg1) { process.stdout.write("Usage: mc connect <task_id>\r\n"); return; }
       attachStdin();
-      return cmdConnectTask(a, arg1).catch((e) => { process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`); });
+      // accept 8-char prefixes: expand against saved tasks, then live server tasks
+      let full = arg1;
+      if (!a.tasks[arg1]) {
+        const pfx = Object.keys(a.tasks || {}).find((id) => id.startsWith(arg1));
+        if (pfx) full = pfx;
+      }
+      const setPointer = (id) => { a.last_task = id; saveSession(s); };
+      return cmdConnectTask(a, full).then(setPointer).catch((e) => {
+        // not saved locally? try the server's task list (covers fresh sessions)
+        if (a.tasks[full]) { process.stdout.write(`\x1b[31m${e.message}\r\n`); return; }
+        (async () => {
+          try {
+            const data = await api("GET", "/users/tasks", { cookie: a.cookie });
+            const m = (data.tasks || []).find((t) => t.id.startsWith(arg1));
+            if (!m) { process.stdout.write(`\x1b[31m${e.message}\r\n`); return; }
+            a.tasks = a.tasks || {};
+            a.tasks[m.id] = { title: (m.content || "").slice(0, 60), vm_id: m.vm_id || null, terminal_id: null, created: m.created_at ? new Date(m.created_at * 1000).toISOString() : new Date().toISOString() };
+            setPointer(m.id);
+            await cmdConnectTask(a, m.id);
+          } catch (e2) { process.stdout.write(`\x1b[31m${e2.message}\r\n`); }
+        })();
+      });
     }
     case "wake": {
       // mc wake <task_id>  (wakes active account's task, like re-chatting)
@@ -765,42 +838,18 @@ const WORKER_URL = process.env.MC_WORKER_URL
         acc = s.accounts[cmd];
         saveSession(s);
       }
-      let ids = Object.keys(acc.tasks || {});
-      // no saved tasks → fetch live tasks from API and pick the latest running one
-      if (!ids.length) {
-        try {
-          process.stdout.write(`Fetching live tasks for account '${s.active}'…\r\n`);
-          const data = await api("GET", "/users/tasks", { cookie: acc.cookie });
-          const live = (data.tasks || []).filter(t => t.status === "pending" || t.status === "processing");
-          const all = data.tasks || [];
-          const pick = live[0] || all[0];
-          if (pick) {
-            // pull VM info from task detail so we have vm_id
-            const detail = await api("GET", `/users/tasks/${pick.id}`, { cookie: acc.cookie });
-            const vmId = detail?.virtualmachine?.id || null;
-            acc.tasks = acc.tasks || {};
-            acc.tasks[pick.id] = {
-              title: (pick.content || "").slice(0, 60),
-              vm_id: vmId,
-              terminal_id: null,
-              created: pick.created_at ? new Date(pick.created_at * 1000).toISOString() : new Date().toISOString(),
-            };
-            acc.last_task = pick.id;
-            ids = Object.keys(acc.tasks);
-            saveSession(s);
-          }
-        } catch (e) {
-          process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`);
-          return;
-        }
-      }
-      if (!ids.length) {
-        process.stdout.write(`Account '${s.active}' has no tasks. Create one: mc new \"<prompt>\"\r\n`);
-        return;
-      }
       attachStdin();
-      const last = acc.last_task || ids[ids.length - 1];
-      cmdConnectTask(acc, last).catch((e) => { process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`); });
+      (async () => {
+        try {
+          const { id, note } = await resolveDefaultTask(s, acc);
+          if (!id) {
+            process.stdout.write(`Account '${s.active}' has no tasks. Create one: mc new \"<prompt>\"\r\n`);
+            return;
+          }
+          if (note) process.stdout.write(`\x1b[33m${note}\x1b[0m\r\n`);
+          await cmdConnectTask(acc, id);
+        } catch (e) { process.stdout.write(`\x1b[31m${e.message}\x1b[0m\r\n`); }
+      })();
     }
   }
 }
